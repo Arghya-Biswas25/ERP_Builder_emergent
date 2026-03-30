@@ -1,34 +1,138 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
+/* ===== Tracing Beam Animation ===== */
+@keyframes tracing-beam {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
 }
 
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
+.tracing-beam {
+  background: linear-gradient(90deg, transparent 0%, var(--zap-accent) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: tracing-beam 2s ease-in-out infinite;
 }
 
-.App-header {
-    background-color: #0f0f10;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
+/* ===== Pulse Glow ===== */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(0, 46, 230, 0.3); }
+  50% { opacity: 0.8; box-shadow: 0 0 8px 4px rgba(0, 46, 230, 0.15); }
+}
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
 }
 
-.App-link {
-    color: #61dafb;
+/* ===== Fade In ===== */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up {
+  animation: fade-in-up 0.3s ease-out forwards;
 }
 
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
+/* ===== Chat Bubbles ===== */
+.chat-msg-user {
+  background-color: var(--zap-primary);
+  color: var(--zap-text-inverse);
+  border-radius: 2px 2px 0 2px;
 }
+.chat-msg-assistant {
+  background-color: var(--zap-surface);
+  color: var(--zap-text-body);
+  border: 1px solid var(--zap-border);
+  border-radius: 2px 2px 2px 0;
+}
+
+/* ===== Code Block ===== */
+.code-block {
+  background-color: #0A0A0A;
+  color: #E5E7EB;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  border-radius: 2px;
+  overflow: auto;
+}
+.code-block pre {
+  margin: 0;
+  padding: 16px;
+}
+
+/* ===== Pipeline Stage ===== */
+.pipeline-stage {
+  transition: all 0.2s ease;
+}
+.pipeline-stage:hover {
+  transform: translateY(-1px);
+}
+.pipeline-stage.active {
+  border-color: var(--zap-accent);
+}
+.pipeline-stage.complete {
+  border-color: var(--zap-success);
+}
+.pipeline-stage.failed {
+  border-color: var(--zap-danger);
+}
+
+/* ===== Typing Indicator ===== */
+@keyframes typing-dot {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-4px); }
+}
+.typing-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--zap-text-muted);
+  margin: 0 2px;
+}
+.typing-dot:nth-child(1) { animation: typing-dot 1.4s ease-in-out infinite 0s; }
+.typing-dot:nth-child(2) { animation: typing-dot 1.4s ease-in-out infinite 0.2s; }
+.typing-dot:nth-child(3) { animation: typing-dot 1.4s ease-in-out infinite 0.4s; }
+
+/* ===== Markdown in Chat ===== */
+.chat-content strong {
+  font-weight: 600;
+  color: var(--zap-text-heading);
+}
+.chat-content p {
+  margin-bottom: 8px;
+}
+.chat-content p:last-child {
+  margin-bottom: 0;
+}
+
+/* ===== Module Grid ===== */
+.module-card {
+  border: 1px solid var(--zap-border);
+  transition: all 0.2s ease;
+  border-radius: 2px;
+}
+.module-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(0,0,0,0.15);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+/* ===== Tab Underline ===== */
+.tab-active {
+  border-bottom: 2px solid var(--zap-accent);
+  color: var(--zap-text-heading);
+  font-weight: 500;
+}
+.tab-inactive {
+  border-bottom: 2px solid transparent;
+  color: var(--zap-text-muted);
+}
+.tab-inactive:hover {
+  color: var(--zap-text-heading);
+  border-bottom-color: rgba(0,0,0,0.1);
+}
+
+/* ===== Staggered Entrance ===== */
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+.stagger-6 { animation-delay: 0.3s; }
