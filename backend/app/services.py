@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
+from inspect import signature
+from inspect import isawaitable
 from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException, status
@@ -21,6 +25,7 @@ from agents import (
 )
 
 from .db import SessionLocal
+from .local_runner import start_project_locally
 from .models import (
     APIConfiguration,
     AuditLog,
@@ -69,6 +74,8 @@ from .schemas import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 PIPELINE_STAGES = [
     "requirement_analysis",
     "requirement_gathering",
@@ -78,6 +85,14 @@ PIPELINE_STAGES = [
     "backend_generation",
     "code_review",
 ]
+
+
+class InProcessBackgroundTasks:
+    def __init__(self) -> None:
+        self.tasks: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def add_task(self, func: Any, *args: Any, **kwargs: Any) -> None:
+        self.tasks.append((func, args, kwargs))
 
 
 def utc_now() -> datetime:
@@ -119,10 +134,18 @@ def update_stage(project: Project, stage: str, status_value: str, output: Any | 
     project.updated_at = utc_now()
 
 
-def reset_generation_stages(project: Project) -> None:
+def reset_generation_stages(project: Project, *, preserve_existing_outputs: bool = False) -> None:
     state = ensure_pipeline_state(project)
     for stage in PIPELINE_STAGES[2:]:
-        state[stage] = {"status": "pending", "output": None, "updated_at": now_iso()}
+        current = dict(state.get(stage) or {})
+        if preserve_existing_outputs and current.get("output") is not None:
+            state[stage] = {
+                "status": "complete",
+                "output": current.get("output"),
+                "updated_at": now_iso(),
+            }
+        else:
+            state[stage] = {"status": "pending", "output": None, "updated_at": now_iso()}
     project.pipeline_state = state
 
 
@@ -191,6 +214,82 @@ def add_notification(db: Session, user_id: str, title: str, body: str, project_i
     )
 
 
+async def _run_in_process_background_tasks(background_tasks: InProcessBackgroundTasks) -> None:
+    for func, args, kwargs in background_tasks.tasks:
+        result = func(*args, **kwargs)
+        if isawaitable(result):
+            await result
+
+
+async def generate_code_bundles(
+    master_json: dict[str, Any],
+    markdown_spec: str,
+    *,
+    existing_frontend_bundle: dict[str, Any] | None = None,
+    existing_backend_bundle: dict[str, Any] | None = None,
+    change_request: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    frontend_result, backend_result = await asyncio.gather(
+        _generate_candidate_code_bundle(
+            frontend_generator,
+            "frontend",
+            master_json,
+            markdown_spec,
+            existing_bundle=existing_frontend_bundle,
+            change_request=change_request,
+        ),
+        _generate_candidate_code_bundle(
+            backend_generator,
+            "backend",
+            master_json,
+            markdown_spec,
+            existing_bundle=existing_backend_bundle,
+            change_request=change_request,
+        ),
+        return_exceptions=True,
+    )
+
+    errors: list[str] = []
+    frontend_bundle: dict[str, Any] | None = None
+    backend_bundle: dict[str, Any] | None = None
+    frontend_changed = False
+    backend_changed = False
+
+    if isinstance(frontend_result, Exception):
+        errors.append(f"Frontend generation failed: {frontend_result}")
+    else:
+        try:
+            frontend_bundle, frontend_changed = frontend_result
+            if existing_frontend_bundle:
+                frontend_bundle = _merge_generated_bundle(existing_frontend_bundle, frontend_bundle)
+        except Exception as exc:
+            errors.append(f"Frontend generation validation failed: {exc}")
+
+    if isinstance(backend_result, Exception):
+        errors.append(f"Backend generation failed: {backend_result}")
+    else:
+        try:
+            backend_bundle, backend_changed = backend_result
+            if existing_backend_bundle:
+                backend_bundle = _merge_generated_bundle(existing_backend_bundle, backend_bundle)
+        except Exception as exc:
+            errors.append(f"Backend generation validation failed: {exc}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    if (
+        change_request
+        and existing_frontend_bundle is not None
+        and existing_backend_bundle is not None
+        and not frontend_changed
+        and not backend_changed
+    ):
+        raise RuntimeError("Revision request completed without changing either the frontend or backend generated code.")
+
+    return frontend_bundle or {"files": [], "dependencies": {}}, backend_bundle or {"files": [], "dependencies": {}}
+
+
 def get_project_or_404(db: Session, project_id: str, user: User) -> Project:
     query = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None))
     if not user.is_superuser:
@@ -199,6 +298,10 @@ def get_project_or_404(db: Session, project_id: str, user: User) -> Project:
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
+
+
+def run_project_locally(db: Session, project: Project) -> dict[str, Any]:
+    return start_project_locally(db, project)
 
 
 def get_requirement_session(db: Session, project: Project) -> RequirementSession:
@@ -291,6 +394,285 @@ def _validate_review(payload: Any) -> dict[str, Any]:
     return CodeReviewPayload.model_validate(payload).model_dump()
 
 
+def _artifact_bundle_from_rows(artifacts: list[GeneratedArtifact]) -> dict[str, Any]:
+    dependencies: dict[str, Any] = {}
+    files = []
+    for artifact in artifacts:
+        files.append(
+            {
+                "path": artifact.file_path,
+                "language": artifact.language or "text",
+                "content": artifact.content_text,
+            }
+        )
+        metadata_dependencies = dict(artifact.metadata_json.get("dependencies") or {})
+        dependencies.update(metadata_dependencies)
+    return {"files": files, "dependencies": dependencies}
+
+
+def hydrate_pipeline_outputs_from_current_version(db: Session, project: Project) -> dict[str, dict[str, Any]]:
+    state = ensure_pipeline_state(project)
+    if not project.current_project_version_id:
+        return state
+
+    project_version = (
+        db.query(ProjectVersion)
+        .filter(ProjectVersion.id == project.current_project_version_id, ProjectVersion.deleted_at.is_(None))
+        .first()
+    )
+    if not project_version:
+        return state
+
+    snapshot = dict(project_version.snapshot_json or {})
+    master_json_output = dict(snapshot.get("master_json") or {})
+    if master_json_output:
+        documentation = dict(master_json_output.get("documentation") or {})
+        if snapshot.get("build_markdown") and not documentation.get("erp_build_markdown"):
+            documentation["erp_build_markdown"] = snapshot.get("build_markdown")
+        if documentation:
+            master_json_output["documentation"] = documentation
+
+    grouped_artifacts: dict[str, list[GeneratedArtifact]] = {}
+    if project_version.generation_job_id:
+        artifacts = (
+            db.query(GeneratedArtifact)
+            .filter(
+                GeneratedArtifact.generation_job_id == project_version.generation_job_id,
+                GeneratedArtifact.project_id == project.id,
+                GeneratedArtifact.deleted_at.is_(None),
+            )
+            .order_by(GeneratedArtifact.file_path.asc())
+            .all()
+        )
+        for artifact in artifacts:
+            grouped_artifacts.setdefault(artifact.artifact_type, []).append(artifact)
+
+    stage_outputs: dict[str, Any] = {
+        "architecture": snapshot.get("architecture"),
+        "json_transform": master_json_output or None,
+        "frontend_generation": _artifact_bundle_from_rows(grouped_artifacts.get("frontend", [])),
+        "backend_generation": _artifact_bundle_from_rows(grouped_artifacts.get("backend", [])),
+        "code_review": snapshot.get("review"),
+    }
+
+    mutated = False
+    for stage, output in stage_outputs.items():
+        if not output:
+            continue
+        stage_state = dict(state.get(stage) or {})
+        if stage_state.get("output") is None:
+            stage_state["output"] = output
+            if stage_state.get("status") == "pending" and project.status == "COMPLETE":
+                stage_state["status"] = "complete"
+            stage_state["updated_at"] = stage_state.get("updated_at") or now_iso()
+            state[stage] = stage_state
+            mutated = True
+
+    if mutated:
+        project.pipeline_state = state
+
+    return state
+
+
+def _load_revision_context(db: Session, project: Project) -> dict[str, Any]:
+    hydrate_pipeline_outputs_from_current_version(db, project)
+    if not project.current_project_version_id:
+        return {}
+
+    project_version = (
+        db.query(ProjectVersion)
+        .filter(ProjectVersion.id == project.current_project_version_id, ProjectVersion.deleted_at.is_(None))
+        .first()
+    )
+    if not project_version:
+        return {}
+
+    snapshot = dict(project_version.snapshot_json or {})
+    context: dict[str, Any] = {
+        "project_version_id": project_version.id,
+        "version_label": project_version.version_label,
+        "changelog": project_version.changelog,
+        "architecture": snapshot.get("architecture") or {},
+        "master_json": snapshot.get("master_json") or {},
+        "build_markdown": snapshot.get("build_markdown") or "",
+        "review": snapshot.get("review") or {},
+    }
+
+    if project_version.generation_job_id:
+        artifacts = (
+            db.query(GeneratedArtifact)
+            .filter(
+                GeneratedArtifact.generation_job_id == project_version.generation_job_id,
+                GeneratedArtifact.project_id == project.id,
+                GeneratedArtifact.deleted_at.is_(None),
+            )
+            .order_by(GeneratedArtifact.file_path.asc())
+            .all()
+        )
+        grouped: dict[str, list[GeneratedArtifact]] = {}
+        for artifact in artifacts:
+            grouped.setdefault(artifact.artifact_type, []).append(artifact)
+        context["frontend_bundle"] = _artifact_bundle_from_rows(grouped.get("frontend", []))
+        context["backend_bundle"] = _artifact_bundle_from_rows(grouped.get("backend", []))
+
+    return context
+
+
+def _merge_generated_bundle(previous_bundle: dict[str, Any] | None, new_bundle: dict[str, Any] | None) -> dict[str, Any]:
+    previous_bundle = dict(previous_bundle or {})
+    new_bundle = dict(new_bundle or {})
+
+    merged_dependencies = dict(previous_bundle.get("dependencies") or {})
+    merged_dependencies.update(dict(new_bundle.get("dependencies") or {}))
+
+    file_map: dict[str, dict[str, Any]] = {}
+    file_order: list[str] = []
+    for bundle in [previous_bundle, new_bundle]:
+        for item in bundle.get("files") or []:
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            if path not in file_map:
+                file_order.append(path)
+            file_map[path] = {
+                "path": path,
+                "language": item.get("language") or "text",
+                "content": item.get("content") or "",
+            }
+
+    return {
+        "files": [file_map[path] for path in file_order],
+        "dependencies": merged_dependencies,
+    }
+
+
+def _strengthen_revision_request(change_request: str | None, target: str) -> str:
+    base_request = (change_request or "").strip() or "Apply the requested revision."
+    return (
+        f"{base_request}\n\n"
+        f"IMPORTANT: The previous {target} revision attempt did not produce meaningful code changes. "
+        f"You must directly modify the existing {target} code to implement this request. "
+        "Return updated file contents for the files that need to change and do not send an unchanged bundle."
+    )
+
+
+def _bundle_candidate_changes_existing(
+    existing_bundle: dict[str, Any] | None,
+    candidate_bundle: dict[str, Any],
+) -> bool:
+    candidate_files = candidate_bundle.get("files") or []
+    candidate_dependencies = dict(candidate_bundle.get("dependencies") or {})
+    if existing_bundle is None:
+        return bool(candidate_files or candidate_dependencies)
+
+    existing_files = {
+        str(item.get("path") or "").strip(): {
+            "content": item.get("content") or "",
+            "language": item.get("language") or "text",
+        }
+        for item in (existing_bundle.get("files") or [])
+        if str(item.get("path") or "").strip()
+    }
+    existing_dependencies = dict(existing_bundle.get("dependencies") or {})
+
+    for item in candidate_files:
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        existing_item = existing_files.get(path)
+        if not existing_item:
+            return True
+        if existing_item["content"] != (item.get("content") or ""):
+            return True
+        if existing_item["language"] != (item.get("language") or "text"):
+            return True
+
+    for name, version in candidate_dependencies.items():
+        if existing_dependencies.get(name) != version:
+            return True
+
+    return False
+
+
+async def _invoke_code_generator(
+    generator: Any,
+    master_json: dict[str, Any],
+    markdown_spec: str,
+    *,
+    existing_bundle: dict[str, Any] | None = None,
+    change_request: str | None = None,
+) -> Any:
+    generator_signature = signature(generator)
+    kwargs: dict[str, Any] = {}
+    if "existing_bundle" in generator_signature.parameters:
+        kwargs["existing_bundle"] = existing_bundle
+    if "change_request" in generator_signature.parameters:
+        kwargs["change_request"] = change_request
+    return await generator(master_json, markdown_spec, **kwargs)
+
+
+async def _generate_candidate_code_bundle(
+    generator: Any,
+    target: str,
+    master_json: dict[str, Any],
+    markdown_spec: str,
+    *,
+    existing_bundle: dict[str, Any] | None = None,
+    change_request: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    candidate_bundle = _validate_bundle(
+        await _invoke_code_generator(
+            generator,
+            master_json,
+            markdown_spec,
+            existing_bundle=existing_bundle,
+            change_request=change_request,
+        )
+    )
+    changed = _bundle_candidate_changes_existing(existing_bundle, candidate_bundle)
+
+    if change_request and existing_bundle is not None and not changed:
+        candidate_bundle = _validate_bundle(
+            await _invoke_code_generator(
+                generator,
+                master_json,
+                markdown_spec,
+                existing_bundle=existing_bundle,
+                change_request=_strengthen_revision_request(change_request, target),
+            )
+        )
+        changed = _bundle_candidate_changes_existing(existing_bundle, candidate_bundle)
+
+    return candidate_bundle, changed
+
+
+async def _invoke_markdown_blueprint_generator(
+    generator: Any,
+    project_name: str,
+    conversation_transcript: str,
+    requirements: dict[str, Any],
+    architecture: dict[str, Any],
+    master_json: dict[str, Any],
+    *,
+    existing_markdown: str | None = None,
+    change_request: str | None = None,
+) -> str:
+    generator_signature = signature(generator)
+    kwargs: dict[str, Any] = {}
+    if "existing_markdown" in generator_signature.parameters:
+        kwargs["existing_markdown"] = existing_markdown
+    if "change_request" in generator_signature.parameters:
+        kwargs["change_request"] = change_request
+    return await generator(
+        project_name,
+        conversation_transcript,
+        requirements,
+        architecture,
+        master_json,
+        **kwargs,
+    )
+
+
 def create_project(db: Session, owner: User, payload: ProjectCreateRequest) -> Project:
     project = Project(
         owner_id=owner.id,
@@ -328,6 +710,23 @@ def create_project(db: Session, owner: User, payload: ProjectCreateRequest) -> P
     return project
 
 
+async def auto_start_project_from_prompt(project_id: str, user_id: str, prompt: str) -> None:
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
+        user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+        if not project or not user or project.status != "INIT":
+            return
+
+        background_tasks = InProcessBackgroundTasks()
+        await handle_project_chat(db, project, user, prompt, background_tasks)
+        await _run_in_process_background_tasks(background_tasks)
+    except Exception:
+        logger.exception("Failed to auto-start project %s from initial prompt", project_id)
+    finally:
+        db.close()
+
+
 async def _queue_generation(
     db: Session,
     project: Project,
@@ -340,7 +739,11 @@ async def _queue_generation(
     if not requirement_session.normalized_requirements:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requirements are not complete yet")
 
-    reset_generation_stages(project)
+    hydrate_pipeline_outputs_from_current_version(db, project)
+    reset_generation_stages(
+        project,
+        preserve_existing_outputs=bool(change_request and project.current_project_version_id and project.status == "COMPLETE"),
+    )
     job = GenerationJob(
         project_id=project.id,
         requested_by_id=user.id,
@@ -349,17 +752,28 @@ async def _queue_generation(
         status="queued",
         current_stage="architecture",
         change_request=change_request,
-        job_spec_json={"change_request": change_request},
+        job_spec_json={"change_request": change_request, "base_project_version_id": project.current_project_version_id},
     )
     db.add(job)
     db.flush()
 
+    if change_request:
+        db.add(
+            Prompt(
+                project_id=project.id,
+                created_by_id=user.id,
+                content=change_request,
+                kind="revision",
+                metadata_json={"base_project_version_id": project.current_project_version_id},
+            )
+        )
+
     project.current_generation_job_id = job.id
     project.status = "ARCHITECTING"
-    project.lifecycle_state = "generation_queued"
+    project.lifecycle_state = "revision_queued" if change_request else "generation_queued"
 
     msg = (
-        "Processing your modification request. Regenerating the affected ERP blueprint and artifacts..."
+        "Applying your changes on top of the current ERP build. Regenerating the affected blueprint and code artifacts..."
         if change_request
         else "Requirements gathered successfully! Now generating your ERP blueprint and code artifacts."
     )
@@ -538,15 +952,23 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
 
         requirement_session = get_requirement_session(db, project)
         requirements = _validate_requirements(requirement_session.normalized_requirements)
+        revision_context = _load_revision_context(db, project) if change_request else {}
 
         job.status = "running"
         job.started_at = utc_now()
         project.status = "ARCHITECTING"
-        project.lifecycle_state = "generation_running"
+        project.lifecycle_state = "revision_running" if change_request else "generation_running"
         update_stage(project, "architecture", "running")
         db.commit()
 
-        architecture = _validate_architecture(await erp_architect(requirements, change_request))
+        architecture = _validate_architecture(
+            await erp_architect(
+                requirements,
+                change_request,
+                existing_architecture=revision_context.get("architecture"),
+                existing_master_json=revision_context.get("master_json"),
+            )
+        )
         update_stage(project, "architecture", "complete", architecture)
         blueprint = BlueprintVersion(
             project_id=project.id,
@@ -569,30 +991,33 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         update_stage(project, "json_transform", "running")
         db.commit()
 
-        master_json = _validate_master_json(await json_transformer(architecture))
-        markdown_spec = await markdown_blueprint_generator(
+        master_json = _validate_master_json(
+            await json_transformer(
+                architecture,
+                existing_master_json=revision_context.get("master_json"),
+                change_request=change_request,
+            )
+        )
+        conversation_transcript = build_chat_transcript(db, project.id)
+        markdown_spec = await _invoke_markdown_blueprint_generator(
+            markdown_blueprint_generator,
             project.name,
-            build_chat_transcript(db, project.id),
+            conversation_transcript,
             requirements,
             architecture,
             master_json,
+            existing_markdown=revision_context.get("build_markdown"),
+            change_request=change_request,
         )
         documentation = dict(master_json.get("documentation") or {})
         documentation["erp_build_markdown"] = markdown_spec
         documentation["source_summary"] = requirement_session.summary or architecture.get("description", "")
-        documentation["chat_transcript_markdown"] = build_chat_transcript(db, project.id)
+        documentation["chat_transcript_markdown"] = conversation_transcript
         master_json["documentation"] = documentation
         update_stage(project, "json_transform", "complete", master_json)
         add_project_message(db, project.id, "assistant", "Blueprint normalized into the master ERP JSON contract.", agent="json_transformer")
         db.commit()
 
-        project.status = "GENERATING_FRONTEND"
-        job.current_stage = "frontend_generation"
-        update_stage(project, "frontend_generation", "running")
-        db.commit()
-
-        frontend_bundle = _validate_bundle(await frontend_generator(master_json, markdown_spec))
-        update_stage(project, "frontend_generation", "complete", frontend_bundle)
         db.add(
             GeneratedArtifact(
                 generation_job_id=job.id,
@@ -615,6 +1040,22 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
                 metadata_json={"source": "json_transformer"},
             )
         )
+
+        project.status = "GENERATING_FRONTEND"
+        job.current_stage = "frontend_generation"
+        update_stage(project, "frontend_generation", "running")
+        update_stage(project, "backend_generation", "running")
+        db.commit()
+
+        frontend_bundle, backend_bundle = await generate_code_bundles(
+            master_json,
+            markdown_spec,
+            existing_frontend_bundle=revision_context.get("frontend_bundle"),
+            existing_backend_bundle=revision_context.get("backend_bundle"),
+            change_request=change_request,
+        )
+        update_stage(project, "frontend_generation", "complete", frontend_bundle)
+        update_stage(project, "backend_generation", "complete", backend_bundle)
         for generated_file in frontend_bundle.get("files", []):
             db.add(
                 GeneratedArtifact(
@@ -628,15 +1069,6 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
                 )
             )
         add_project_message(db, project.id, "assistant", "Frontend artifacts generated.", agent="frontend_generator")
-        db.commit()
-
-        project.status = "GENERATING_BACKEND"
-        job.current_stage = "backend_generation"
-        update_stage(project, "backend_generation", "running")
-        db.commit()
-
-        backend_bundle = _validate_bundle(await backend_generator(master_json, markdown_spec))
-        update_stage(project, "backend_generation", "complete", backend_bundle)
         for generated_file in backend_bundle.get("files", []):
             db.add(
                 GeneratedArtifact(
@@ -671,6 +1103,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
                 "master_json": master_json,
                 "build_markdown": markdown_spec,
                 "review": review,
+                "base_project_version_id": revision_context.get("project_version_id"),
             },
         )
         db.add(project_version)
@@ -685,6 +1118,7 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
         job.result_summary_json = {
             "blueprint_version_id": blueprint.id,
             "project_version_id": project_version.id,
+            "base_project_version_id": revision_context.get("project_version_id"),
             "markdown_spec_available": bool(markdown_spec),
             "frontend_file_count": len(frontend_bundle.get("files", [])),
             "backend_file_count": len(backend_bundle.get("files", [])),
@@ -695,8 +1129,13 @@ async def run_generation_pipeline(project_id: str, job_id: str, change_request: 
             project.id,
             "assistant",
             (
-                f"Your ERP system is ready. Blueprint version {blueprint.version_number} and project version "
-                f"{project_version.version_label} were generated successfully."
+                f"Your changes have been applied on top of {revision_context.get('version_label', 'the previous version')}. "
+                f"Blueprint version {blueprint.version_number} and project version {project_version.version_label} are ready."
+                if change_request
+                else (
+                    f"Your ERP system is ready. Blueprint version {blueprint.version_number} and project version "
+                    f"{project_version.version_label} were generated successfully."
+                )
             ),
             agent="orchestrator",
         )

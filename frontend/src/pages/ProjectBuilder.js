@@ -7,7 +7,7 @@ import PipelineProgress from "@/components/PipelineProgress";
 import { Zap, ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
 
-const POLLING_STATUSES = ["ANALYZING", "ARCHITECTING", "TRANSFORMING", "GENERATING_FRONTEND", "GENERATING_BACKEND", "REVIEWING"];
+const POLLING_STATUSES = ["INIT", "ANALYZING", "GATHERING", "ARCHITECTING", "TRANSFORMING", "GENERATING_FRONTEND", "GENERATING_BACKEND", "REVIEWING"];
 
 export default function ProjectBuilder() {
   const { id } = useParams();
@@ -18,6 +18,7 @@ export default function ProjectBuilder() {
   const [chatLoading, setChatLoading] = useState(false);
   const initialSent = useRef(false);
   const pollRef = useRef(null);
+  const projectStatus = project?.status;
 
   const fetchProject = useCallback(async () => {
     try {
@@ -43,17 +44,45 @@ export default function ProjectBuilder() {
     Promise.all([fetchProject(), fetchMessages()]).finally(() => setLoading(false));
   }, [fetchProject, fetchMessages]);
 
+  const handleSend = useCallback(async (content) => {
+    if (!content.trim() || chatLoading) return;
+    setMessages(prev => [...prev, { id: Date.now().toString(), role: "user", content, created_at: new Date().toISOString() }]);
+    setChatLoading(true);
+    try {
+      await sendChat(id, content);
+      await fetchMessages();
+      await fetchProject();
+    } catch {
+      toast.error("Failed to send message");
+    } finally {
+      setChatLoading(false);
+    }
+  }, [chatLoading, id, fetchMessages, fetchProject]);
+
   // Auto-send initial prompt
   useEffect(() => {
-    if (project?.status === "INIT" && !initialSent.current && project.prompt) {
+    if (!project?.prompt || project?.status !== "INIT" || initialSent.current) {
+      return;
+    }
+    if (messages.length > 0) {
+      return;
+    }
+    const projectAgeMs = Date.now() - new Date(project.created_at).getTime();
+    if (projectAgeMs < 2000) {
+      return;
+    }
+    if (chatLoading) {
+      return;
+    }
+    if (messages.length === 0) {
       initialSent.current = true;
       handleSend(project.prompt);
     }
-  }, [project]);
+  }, [project, messages.length, chatLoading, handleSend]);
 
   // Polling during auto-pipeline
   useEffect(() => {
-    if (project && POLLING_STATUSES.includes(project.status)) {
+    if (projectStatus && POLLING_STATUSES.includes(projectStatus)) {
       pollRef.current = setInterval(async () => {
         const p = await fetchProject();
         await fetchMessages();
@@ -63,24 +92,7 @@ export default function ProjectBuilder() {
       }, 3000);
     }
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [project?.status, fetchProject, fetchMessages]);
-
-  async function handleSend(content) {
-    if (!content.trim() || chatLoading) return;
-    // Optimistic user message
-    setMessages(prev => [...prev, { id: Date.now().toString(), role: "user", content, created_at: new Date().toISOString() }]);
-    setChatLoading(true);
-    try {
-      const result = await sendChat(id, content);
-      // Refresh messages from server
-      await fetchMessages();
-      await fetchProject();
-    } catch (e) {
-      toast.error("Failed to send message");
-    } finally {
-      setChatLoading(false);
-    }
-  }
+  }, [projectStatus, fetchProject, fetchMessages]);
 
   if (loading || !project) {
     return (

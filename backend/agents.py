@@ -23,10 +23,26 @@ OPENROUTER_URL = (
 )
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "").strip()
 OPENROUTER_MODELS = os.environ.get("OPENROUTER_MODELS", "").strip()
+OPENROUTER_ANALYSIS_MODEL = os.environ.get("OPENROUTER_ANALYSIS_MODEL", "").strip()
+OPENROUTER_ANALYSIS_MODELS = os.environ.get("OPENROUTER_ANALYSIS_MODELS", "").strip()
+OPENROUTER_CODE_MODEL = os.environ.get("OPENROUTER_CODE_MODEL", "").strip()
+OPENROUTER_CODE_MODELS = os.environ.get("OPENROUTER_CODE_MODELS", "").strip()
 OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "http://127.0.0.1:3001").strip() or "http://127.0.0.1:3001"
 OPENROUTER_APP_NAME = os.environ.get("OPENROUTER_APP_NAME", "AI ERP Builder").strip() or "AI ERP Builder"
 OPENROUTER_TIMEOUT = max(5, int((os.environ.get("OPENROUTER_TIMEOUT", "90") or "90").strip()))
-MARKDOWN_BLUEPRINT_TIMEOUT = min(OPENROUTER_TIMEOUT, 12)
+ANALYSIS_TIMEOUT = min(max(30, OPENROUTER_TIMEOUT), 60)
+ARCHITECTURE_TIMEOUT = min(max(45, OPENROUTER_TIMEOUT), 90)
+JSON_TRANSFORM_TIMEOUT = min(max(45, OPENROUTER_TIMEOUT), 90)
+MARKDOWN_BLUEPRINT_TIMEOUT = min(max(60, OPENROUTER_TIMEOUT), 120)
+CODE_GENERATION_TIMEOUT = min(max(60, OPENROUTER_TIMEOUT), 180)
+CODE_REVIEW_TIMEOUT = min(max(45, OPENROUTER_TIMEOUT), 120)
+REQUIREMENT_ANALYSIS_MAX_TOKENS = 1200
+REQUIREMENT_GATHERING_MAX_TOKENS = 1800
+ARCHITECTURE_MAX_TOKENS = 3400
+JSON_TRANSFORM_MAX_TOKENS = 3200
+MARKDOWN_BLUEPRINT_MAX_TOKENS = 3600
+FRONTEND_CODE_MAX_TOKENS = 5200
+BACKEND_CODE_MAX_TOKENS = 5200
 
 
 def _dedupe_models(models):
@@ -41,12 +57,28 @@ def _dedupe_models(models):
     return unique
 
 
-MODELS = _dedupe_models(
+DEFAULT_MODELS = _dedupe_models(
     [part.strip() for part in OPENROUTER_MODELS.split(",")]
     + [OPENROUTER_MODEL]
 )
+ANALYSIS_MODELS = _dedupe_models(
+    [part.strip() for part in OPENROUTER_ANALYSIS_MODELS.split(",")]
+    + [OPENROUTER_ANALYSIS_MODEL]
+)
+CODE_MODELS = _dedupe_models(
+    [part.strip() for part in OPENROUTER_CODE_MODELS.split(",")]
+    + [OPENROUTER_CODE_MODEL]
+)
 
 REMOTE_LLM_DISABLED_REASON = None
+
+
+def _resolve_models(model_group):
+    if model_group == "analysis":
+        return ANALYSIS_MODELS or DEFAULT_MODELS
+    if model_group == "code":
+        return CODE_MODELS or DEFAULT_MODELS
+    return DEFAULT_MODELS
 
 INDUSTRY_KEYWORDS = {
     "manufacturing": ["manufacturing", "factory", "production", "assembly", "plant"],
@@ -835,11 +867,12 @@ def _should_disable_remote(message):
     )
 
 
-def _call_llm_sync(messages, temperature=0.7, max_tokens=4000):
+def _call_llm_sync(messages, temperature=0.7, max_tokens=4000, model_group="default"):
+    models = _resolve_models(model_group)
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    if not MODELS:
-        raise RuntimeError("No OpenRouter model configured")
+    if not models:
+        raise RuntimeError(f"No OpenRouter model configured for {model_group}")
     if _remote_llm_unavailable():
         raise RuntimeError(REMOTE_LLM_DISABLED_REASON)
 
@@ -851,7 +884,7 @@ def _call_llm_sync(messages, temperature=0.7, max_tokens=4000):
     }
     errors = []
 
-    for model in MODELS:
+    for model in models:
         payload = {
             "model": model,
             "messages": messages,
@@ -901,8 +934,8 @@ def _call_llm_sync(messages, temperature=0.7, max_tokens=4000):
     raise RuntimeError("; ".join(errors) if errors else "All models failed")
 
 
-async def call_llm(messages, temperature=0.7, max_tokens=4000, timeout=None):
-    task = asyncio.to_thread(_call_llm_sync, messages, temperature, max_tokens)
+async def call_llm(messages, temperature=0.7, max_tokens=4000, timeout=None, model_group="default"):
+    task = asyncio.to_thread(_call_llm_sync, messages, temperature, max_tokens, model_group)
     if timeout:
         return await asyncio.wait_for(task, timeout=timeout)
     return await task
@@ -947,6 +980,27 @@ def _extract_json(text):
                     except json.JSONDecodeError:
                         break
     raise ValueError(f"Could not extract JSON from: {text[:300]}")
+
+
+def _stringify_progress_summary(summary):
+    if summary is None:
+        return None
+    if isinstance(summary, str):
+        return summary.strip() or None
+    if isinstance(summary, dict):
+        parts = []
+        for key, value in summary.items():
+            if isinstance(value, dict):
+                details = [item.replace("_", " ") for item, enabled in value.items() if enabled]
+                parts.append(f"{key} features: {', '.join(details)}" if details else str(key))
+            elif isinstance(value, list):
+                parts.append(f"{key}: {', '.join(str(item) for item in value)}")
+            else:
+                parts.append(f"{key}: {value}")
+        return "; ".join(parts) if parts else json.dumps(summary)
+    if isinstance(summary, list):
+        return ", ".join(str(item) for item in summary)
+    return str(summary)
 
 
 def _slugify(value):
@@ -1811,7 +1865,13 @@ Output ONLY the JSON object."""
         {"role": "user", "content": prompt},
     ]
     try:
-        result = await call_llm(messages, temperature=0.3)
+        result = await call_llm(
+            messages,
+            temperature=0.3,
+            max_tokens=REQUIREMENT_ANALYSIS_MAX_TOKENS,
+            timeout=ANALYSIS_TIMEOUT,
+            model_group="analysis",
+        )
         return _extract_json(result)
     except Exception as exc:
         logger.warning("Requirement analyzer falling back to local generation: %s", exc)
@@ -1823,7 +1883,7 @@ async def requirement_gatherer(analysis, conversation_history):
     msg_count = len([m for m in conversation_history if m.get("role") == "user"])
 
     force_complete = ""
-    if msg_count >= 4:
+    if msg_count >= 3:
         force_complete = "\n\nIMPORTANT: You have already asked enough questions. You MUST now set complete=true and provide the full requirements document. Do NOT ask more questions."
 
     system_prompt = f"""You are an ERP Requirements Gathering Agent. You help build an ERP for a {analysis.get('business_type', 'business')} in {analysis.get('industry', 'general')}.
@@ -1856,11 +1916,34 @@ Output ONLY JSON."""
             messages.append({"role": msg["role"], "content": msg["content"]})
 
     try:
-        result = await call_llm(messages, temperature=0.4)
+        result = await call_llm(
+            messages,
+            temperature=0.4,
+            max_tokens=REQUIREMENT_GATHERING_MAX_TOKENS,
+            timeout=ANALYSIS_TIMEOUT,
+            model_group="analysis",
+        )
         logger.info("Gatherer raw response: %s", result[:500])
         parsed = _extract_json(result)
         if isinstance(parsed, list):
             parsed = parsed[0] if parsed and isinstance(parsed[0], dict) else {"complete": False, "question": result.strip()}
+        if isinstance(parsed, dict):
+            parsed["progress_summary"] = _stringify_progress_summary(parsed.get("progress_summary"))
+            if msg_count >= 3:
+                requirements = parsed.get("requirements")
+                if not parsed.get("complete") or not isinstance(requirements, dict):
+                    return {
+                        "complete": True,
+                        "requirements": _fallback_requirements_document(analysis, conversation_history),
+                        "progress_summary": parsed.get("progress_summary")
+                        or _fallback_progress_summary(analysis, conversation_history),
+                    }
+        elif msg_count >= 3:
+            return {
+                "complete": True,
+                "requirements": _fallback_requirements_document(analysis, conversation_history),
+                "progress_summary": _fallback_progress_summary(analysis, conversation_history),
+            }
         return parsed
     except Exception as exc:
         logger.warning("Requirement gatherer falling back to local generation: %s", exc)
@@ -1886,12 +1969,25 @@ Output ONLY JSON."""
         }
 
 
-async def erp_architect(requirements, modification=None):
+async def erp_architect(requirements, modification=None, existing_architecture=None, existing_master_json=None):
     mod_text = ""
     if modification:
-        mod_text = f"\n\nMODIFICATION REQUEST: {modification}\nApply this change while keeping the rest intact."
+        mod_text = (
+            f"\n\nMODIFICATION REQUEST: {modification}\n"
+            "Apply this change on top of the current ERP while keeping unaffected modules, entities, APIs, workflows, and UX intact."
+        )
 
-    system_prompt = f"""You are an ERP System Architect. Design a complete ERP architecture from requirements.{mod_text}
+    existing_context = ""
+    if existing_architecture or existing_master_json:
+        existing_context = (
+            "\n\nCURRENT ERP CONTEXT:\n"
+            "This is a revision of an existing ERP build, not a clean-sheet design.\n"
+            "Return a full updated architecture, but preserve unaffected structure.\n"
+            f"Existing Architecture:\n{json.dumps(existing_architecture or {}, indent=2)[:14000]}\n\n"
+            f"Existing Master JSON:\n{json.dumps(existing_master_json or {}, indent=2)[:14000]}"
+        )
+
+    system_prompt = f"""You are an ERP System Architect. Design a complete, production-oriented ERP architecture from requirements.{mod_text}{existing_context}
 
 Respond with ONLY valid JSON:
 {{
@@ -1932,14 +2028,28 @@ Respond with ONLY valid JSON:
   "tech_stack": {{"frontend": "React + Tailwind CSS", "backend": "FastAPI + Python", "database": "PostgreSQL", "auth": "JWT + RBAC"}}
 }}
 
-Design 4-8 modules with realistic entities, endpoints, workflows. Output ONLY JSON."""
+Rules:
+- Return the full latest architecture, not a patch diff.
+- If this is a revision, edit the current ERP in place and preserve unaffected modules, entities, endpoints, workflows, roles, and naming.
+- Be highly detailed and realistic enough that the JSON and Markdown stages can generate deployable code without re-interviewing the user.
+- Prefer coherent module boundaries, realistic workflows, RBAC, reporting, dashboard needs, validations, automation hooks, and integration touchpoints.
+- Include all modules needed by the business problem, not just a demo slice.
+- Keep the structure stable across revisions so future chat requests can keep editing the same ERP.
+
+Design 4-8 realistic modules with production-grade entities, endpoints, workflows, and roles. Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Requirements:\n{json.dumps(requirements, indent=2)}"},
     ]
     try:
-        result = await call_llm(messages, temperature=0.3, max_tokens=4000)
+        result = await call_llm(
+            messages,
+            temperature=0.3,
+            max_tokens=ARCHITECTURE_MAX_TOKENS,
+            timeout=ARCHITECTURE_TIMEOUT,
+            model_group="analysis",
+        )
         parsed = _extract_json(result)
         if isinstance(parsed, list):
             parsed = {
@@ -1980,8 +2090,17 @@ Design 4-8 modules with realistic entities, endpoints, workflows. Output ONLY JS
         return _fallback_architecture(requirements, modification)
 
 
-async def json_transformer(architecture):
-    system_prompt = """You are a JSON Schema Transformer. Convert ERP architecture into a strict master JSON.
+async def json_transformer(architecture, existing_master_json=None, change_request=None):
+    revision_text = ""
+    if existing_master_json or change_request:
+        revision_text = (
+            "\n\nThis is a revision of an existing master JSON contract."
+            "\nPreserve unchanged modules, tables, permissions, and config unless the new architecture explicitly changes them."
+            f"\nChange request: {change_request or 'No explicit change request provided.'}"
+            f"\nExisting master JSON:\n{json.dumps(existing_master_json or {}, indent=2)[:14000]}"
+        )
+
+    system_prompt = revision_text + """You are a JSON Schema Transformer. Convert ERP architecture into a strict, very detailed master JSON contract for ERP code generation.
 
 Respond with ONLY valid JSON:
 {
@@ -2006,15 +2125,77 @@ Respond with ONLY valid JSON:
   "config": {"pagination_default": 20, "date_format": "ISO8601", "currency": "USD"}
 }
 
-Validate all cross-references. Output ONLY JSON."""
+Rules:
+- Return the full current master JSON, never a partial diff.
+- If this is a revision, update the existing master JSON in place and preserve unaffected modules, tables, permissions, workflows, dashboards, forms, and config.
+- Make the output rich enough to directly drive code generation for frontend and backend.
+- Include detailed entities, fields, validations, endpoints, ui_components, workflows, automation opportunities, reporting needs, and role/permission mappings when the architecture implies them.
+- Keep IDs, module slugs, and stable paths consistent across revisions whenever possible.
+- Validate all cross-references between modules, entities, endpoints, roles, and database tables.
+
+Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Architecture:\n{json.dumps(architecture, indent=2)}"},
     ]
     try:
-        result = await call_llm(messages, temperature=0.2, max_tokens=4000)
-        return _extract_json(result)
+        result = await call_llm(
+            messages,
+            temperature=0.2,
+            max_tokens=JSON_TRANSFORM_MAX_TOKENS,
+            timeout=JSON_TRANSFORM_TIMEOUT,
+            model_group="analysis",
+        )
+        parsed = _extract_json(result)
+        if isinstance(parsed, list):
+            parsed = {"modules": parsed}
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON transformer returned a non-object payload")
+
+        fallback = _fallback_master_json(architecture)
+        merged = dict(fallback)
+        merged["version"] = str(parsed.get("version") or fallback["version"])
+
+        for key in ["system", "database", "auth", "config"]:
+            value = parsed.get(key)
+            if isinstance(value, dict):
+                combined = dict(fallback[key])
+                combined.update(value)
+                merged[key] = combined
+            else:
+                merged[key] = fallback[key]
+
+        modules = parsed.get("modules")
+        merged["modules"] = modules if isinstance(modules, list) else fallback["modules"]
+
+        normalized_modules = []
+        for module in merged["modules"]:
+            if not isinstance(module, dict):
+                normalized_modules = fallback["modules"]
+                break
+            normalized = dict(module)
+            normalized["id"] = normalized.get("id") or _slugify(normalized.get("name", "module"))
+            normalized["icon"] = normalized.get("icon") or "package"
+            normalized["enabled"] = normalized.get("enabled", True)
+            normalized["entities"] = normalized.get("entities") if isinstance(normalized.get("entities"), list) else []
+            normalized["endpoints"] = (
+                normalized.get("endpoints")
+                if isinstance(normalized.get("endpoints"), list)
+                else normalized.get("api_endpoints")
+                if isinstance(normalized.get("api_endpoints"), list)
+                else []
+            )
+            normalized["workflows"] = normalized.get("workflows") if isinstance(normalized.get("workflows"), list) else []
+            normalized["ui_components"] = (
+                normalized.get("ui_components")
+                if isinstance(normalized.get("ui_components"), list)
+                else _build_ui_components(normalized)
+            )
+            normalized_modules.append(normalized)
+
+        merged["modules"] = normalized_modules
+        return merged
     except Exception as exc:
         logger.warning("JSON transformer falling back to local generation: %s", exc)
         return _fallback_master_json(architecture)
@@ -2204,11 +2385,32 @@ def is_valid_markdown_blueprint(text):
     return _is_valid_markdown_blueprint(text)
 
 
-async def markdown_blueprint_generator(project_name, conversation_transcript, requirements, architecture, master_json):
+async def markdown_blueprint_generator(
+    project_name,
+    conversation_transcript,
+    requirements,
+    architecture,
+    master_json,
+    existing_markdown=None,
+    change_request=None,
+):
+    revision_text = ""
+    if existing_markdown or change_request:
+        revision_text = dedent(
+            f"""
+            This is a revision of an existing ERP implementation guide.
+            Update the current Markdown guide in place instead of rewriting it from scratch.
+            Preserve unaffected sections, module names, conventions, and implementation decisions unless the new blueprint changes them.
+            Change request: {change_request or 'No explicit change request provided.'}
+            Existing Markdown Guide:
+            {str(existing_markdown or '')[:14000]}
+            """
+        ).strip()
+
     system_prompt = dedent(
-        """
+        f"""
         You are a senior ERP solution writer. Convert the complete project conversation summary and JSON blueprint
-        into a self-sufficient Markdown implementation guide that can be used to rebuild the ERP system independently.
+        into a self-sufficient Markdown implementation guide that can be used to rebuild and revise the ERP system independently.
 
         Requirements:
         - Output ONLY Markdown.
@@ -2217,7 +2419,10 @@ async def markdown_blueprint_generator(project_name, conversation_transcript, re
           backend implementation guidance, frontend implementation guidance, API expectations, permissions/RBAC,
           automation opportunities, deployment notes, and a build checklist.
         - Treat the chat transcript as the human requirement narrative and the JSON blueprint as the canonical technical contract.
-        - The result should be useful as an indigenous build guide for recreating the ERP system from scratch.
+        - The result must be detailed enough that the code-generation stage can build deployable ERP modules directly from the Markdown and JSON together.
+        - When revising, keep the same ERP continuity and update only what the new chat request changes.
+        - Be explicit about modules, flows, data rules, reports, dashboards, forms, deployment assumptions, and future editability.
+        {revision_text}
         """
     ).strip()
 
@@ -2232,6 +2437,7 @@ async def markdown_blueprint_generator(project_name, conversation_transcript, re
             "role": "user",
             "content": (
                 f"Project Name:\n{project_name}\n\n"
+                f"Change Request:\n{change_request or 'Initial build'}\n\n"
                 f"Conversation Transcript:\n{transcript}\n\n"
                 f"Requirements JSON:\n{json.dumps(requirements, indent=2)}\n\n"
                 f"Architecture JSON:\n{json.dumps(architecture, indent=2)}\n\n"
@@ -2243,8 +2449,9 @@ async def markdown_blueprint_generator(project_name, conversation_transcript, re
         result = await call_llm(
             messages,
             temperature=0.2,
-            max_tokens=3500,
+            max_tokens=MARKDOWN_BLUEPRINT_MAX_TOKENS,
             timeout=MARKDOWN_BLUEPRINT_TIMEOUT,
+            model_group="analysis",
         )
         if isinstance(result, str):
             normalized = result.strip()
@@ -2256,8 +2463,19 @@ async def markdown_blueprint_generator(project_name, conversation_transcript, re
         return _fallback_markdown_blueprint(project_name, conversation_transcript, requirements, architecture, master_json)
 
 
-async def frontend_generator(master_json, implementation_markdown=None):
-    system_prompt = """You are a Frontend Code Generator. Generate React + Tailwind components from the ERP JSON schema.
+async def frontend_generator(master_json, implementation_markdown=None, existing_bundle=None, change_request=None):
+    revision_text = ""
+    if existing_bundle or change_request:
+        revision_text = (
+            "\n\nYou are revising an existing frontend codebase."
+            "\nUpdate only what the change request requires and preserve unaffected files."
+            "\nReturn complete updated contents for files you touch."
+            "\nYou must change at least one relevant file when the request requires a visible product change."
+            f"\nChange request: {change_request or 'No explicit change request provided.'}"
+            f"\nExisting frontend bundle:\n{json.dumps(existing_bundle or {}, indent=2)[:14000]}"
+        )
+
+    system_prompt = revision_text + """You are a Frontend Code Generator. Generate a deployable React + Tailwind ERP frontend from the ERP JSON schema and Markdown implementation guide.
 
 Respond with ONLY valid JSON:
 {
@@ -2269,14 +2487,15 @@ Respond with ONLY valid JSON:
   "dependencies": {"react": "^18.0.0", "react-router-dom": "^6.0.0", "tailwindcss": "^3.0.0"}
 }
 
-Generate:
-1. App.jsx with router and layout
-2. Dashboard.jsx with module cards and stats
-3. One CRUD page for the primary module
-4. Shared Layout with sidebar navigation
+Rules:
+- Return a full updated frontend bundle for the current ERP, not a toy sample.
+- Cover all enabled modules that matter to the blueprint, prioritizing production-ready navigation, dashboards, CRUD flows, forms, tables, detail views, workflow actions, and API integration points.
+- When revising, edit the current codebase in place and preserve unaffected files, routes, component structure, and naming.
+- Return complete contents for every file you touch.
+- Keep the output deployable, consistent, and easy to edit again on future chat requests.
+- Prefer stable file paths across revisions so follow-up edits can continue on top of the existing bundle.
 
-Use Tailwind CSS, lucide-react icons. Keep code concise but functional.
-Output ONLY JSON."""
+Use Tailwind CSS and lucide-react where appropriate. Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -2289,15 +2508,32 @@ Output ONLY JSON."""
         },
     ]
     try:
-        result = await call_llm(messages, temperature=0.3, max_tokens=4000)
+        result = await call_llm(
+            messages,
+            temperature=0.3,
+            max_tokens=FRONTEND_CODE_MAX_TOKENS,
+            timeout=CODE_GENERATION_TIMEOUT,
+            model_group="code",
+        )
         return _extract_json(result)
     except Exception as exc:
         logger.warning("Frontend generator falling back to local generation: %s", exc)
         return _frontend_file_bundle(master_json)
 
 
-async def backend_generator(master_json, implementation_markdown=None):
-    system_prompt = """You are a Backend Code Generator. Generate FastAPI + SQLAlchemy code from the ERP JSON schema.
+async def backend_generator(master_json, implementation_markdown=None, existing_bundle=None, change_request=None):
+    revision_text = ""
+    if existing_bundle or change_request:
+        revision_text = (
+            "\n\nYou are revising an existing backend codebase."
+            "\nUpdate only what the change request requires and preserve unaffected files."
+            "\nReturn complete updated contents for files you touch."
+            "\nYou must change at least one relevant file when the request requires backend or API behavior changes."
+            f"\nChange request: {change_request or 'No explicit change request provided.'}"
+            f"\nExisting backend bundle:\n{json.dumps(existing_bundle or {}, indent=2)[:14000]}"
+        )
+
+    system_prompt = revision_text + """You are a Backend Code Generator. Generate a deployable FastAPI + SQLAlchemy ERP backend from the ERP JSON schema and Markdown implementation guide.
 
 Respond with ONLY valid JSON:
 {
@@ -2311,14 +2547,16 @@ Respond with ONLY valid JSON:
   "dependencies": {"fastapi": ">=0.100.0", "sqlalchemy": ">=2.0.0", "pydantic": ">=2.0.0"}
 }
 
-Generate:
-1. main.py - FastAPI app with CORS and middleware
-2. models.py - SQLAlchemy models for key entities
-3. routes.py - CRUD routes for primary module
-4. auth.py - JWT authentication
-5. database.py - DB connection
+Rules:
+- Return a full updated backend bundle for the current ERP, not a minimal demo slice.
+- Generate production-minded API structure, models, schemas, services, routers, auth, database setup, and health/runtime essentials required by the blueprint.
+- Cover all major enabled modules that the current blueprint requires.
+- When revising, edit the current backend in place and preserve unaffected files, endpoints, models, and module boundaries.
+- Return complete contents for every file you touch.
+- Keep the backend deployable and ready for future edits from the chatbox.
+- Prefer stable file paths and module names across revisions.
 
-Include proper error handling. Output ONLY JSON."""
+Include proper validation, error handling, and runtime-readiness. Output ONLY JSON."""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -2331,7 +2569,13 @@ Include proper error handling. Output ONLY JSON."""
         },
     ]
     try:
-        result = await call_llm(messages, temperature=0.3, max_tokens=4000)
+        result = await call_llm(
+            messages,
+            temperature=0.3,
+            max_tokens=BACKEND_CODE_MAX_TOKENS,
+            timeout=CODE_GENERATION_TIMEOUT,
+            model_group="code",
+        )
         return _extract_json(result)
     except Exception as exc:
         logger.warning("Backend generator falling back to local generation: %s", exc)
@@ -2374,7 +2618,13 @@ Be constructive and specific. Output ONLY JSON."""
         {"role": "user", "content": f"Code to review:\n{code_ctx}"},
     ]
     try:
-        result = await call_llm(messages, temperature=0.3, max_tokens=3000)
+        result = await call_llm(
+            messages,
+            temperature=0.3,
+            max_tokens=3000,
+            timeout=CODE_REVIEW_TIMEOUT,
+            model_group="code",
+        )
         return _extract_json(result)
     except Exception as exc:
         logger.warning("Code reviewer falling back to local generation: %s", exc)

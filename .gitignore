@@ -18,6 +18,9 @@ node_modules/
 
 # Testing
 /coverage
+.pytest_cache/
+pytest-cache-files-*/
+tests/pytest-cache-files-*/
 
 # Next.js
 /.next/
@@ -79,6 +82,8 @@ agenthub/agents/youtube/db
 
 # Build caches
 .cache/
+runtime-generated/
+runtime-logs/
 
 memory/test_credentials.md
 

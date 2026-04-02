@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
     openrouter_model: str = Field(default="deepseek/deepseek-v3.2-speciale", alias="OPENROUTER_MODEL")
     openrouter_models: str = Field(default="", alias="OPENROUTER_MODELS")
+    openrouter_analysis_model: str = Field(default="", alias="OPENROUTER_ANALYSIS_MODEL")
+    openrouter_analysis_models: str = Field(default="", alias="OPENROUTER_ANALYSIS_MODELS")
+    openrouter_code_model: str = Field(default="", alias="OPENROUTER_CODE_MODEL")
+    openrouter_code_models: str = Field(default="", alias="OPENROUTER_CODE_MODELS")
     openrouter_base_url: str = Field(
         default="https://openrouter.ai/api/v1/chat/completions",
         alias="OPENROUTER_BASE_URL",

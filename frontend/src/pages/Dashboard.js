@@ -31,6 +31,43 @@ const EXAMPLES = [
   "Design an ERP for a construction company with project management, procurement, and HR",
 ];
 
+const CREATE_RECOVERY_DELAY_MS = 2500;
+const CREATE_RECOVERY_POLL_MS = 1500;
+const CREATE_RECOVERY_ATTEMPTS = 8;
+const RECENT_PROJECT_WINDOW_MS = 3 * 60 * 1000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecentProjectMatch(project, name, prompt) {
+  if (!project) return false;
+  if ((project.name || "").trim() !== name) return false;
+  if ((project.prompt || "").trim() !== prompt) return false;
+
+  const timestamp = Date.parse(project.created_at || project.updated_at || "");
+  if (!Number.isFinite(timestamp)) return false;
+
+  return Date.now() - timestamp <= RECENT_PROJECT_WINDOW_MS;
+}
+
+function describeCreateError(error) {
+  const detail = error?.response?.data?.detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail
+      .map((item) => item?.msg || item?.message || "Validation error")
+      .filter(Boolean)
+      .join("; ");
+  }
+  if (typeof detail === "string" && detail.trim()) {
+    return detail.trim();
+  }
+  if (typeof error?.message === "string" && error.message.trim()) {
+    return error.message.trim();
+  }
+  return "Project creation failed. Please check the backend connection and try again.";
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState([]);
@@ -38,6 +75,7 @@ export default function Dashboard() {
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [creating, setCreating] = useState(false);
+  const [createStatusMessage, setCreateStatusMessage] = useState("");
 
   useEffect(() => { loadProjects(); }, []);
 
@@ -48,16 +86,86 @@ export default function Dashboard() {
     } catch { /* ignore */ }
   }
 
+  async function findRecentCreatedProject(projectName, projectPrompt) {
+    try {
+      const items = await listProjects();
+      return items
+        .filter((project) => isRecentProjectMatch(project, projectName, projectPrompt))
+        .sort((a, b) => Date.parse(b.created_at || b.updated_at || "") - Date.parse(a.created_at || a.updated_at || ""))[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
   async function handleCreate() {
     if (!name.trim() || !prompt.trim()) { toast.error("Fill in all fields"); return; }
+    const projectName = name.trim();
+    const projectPrompt = prompt.trim();
     setCreating(true);
+    setCreateStatusMessage("Creating the project shell. The builder page should open in a moment.");
+
+    let navigated = false;
+    const openProject = (project, source) => {
+      navigated = true;
+      setOpen(false);
+      navigate(`/project/${project.id}`, {
+        state: {
+          createSource: source,
+          justCreated: true,
+        },
+      });
+    };
+
+    const recoveryPromise = (async () => {
+      await sleep(CREATE_RECOVERY_DELAY_MS);
+      if (navigated) return null;
+
+      setCreateStatusMessage(
+        "The project may already be created. Checking the latest projects and opening it automatically..."
+      );
+
+      for (let attempt = 0; attempt < CREATE_RECOVERY_ATTEMPTS && !navigated; attempt += 1) {
+        const existingProject = await findRecentCreatedProject(projectName, projectPrompt);
+        if (existingProject) {
+          return existingProject;
+        }
+        await sleep(CREATE_RECOVERY_POLL_MS);
+      }
+
+      return null;
+    })();
+
     try {
-      const project = await createProject(name.trim(), prompt.trim());
-      navigate(`/project/${project.id}`);
+      const createRequest = createProject(projectName, projectPrompt);
+      const firstResult = await Promise.race([
+        createRequest.then((project) => ({ source: "create-response", project })),
+        recoveryPromise.then((project) => (project ? { source: "recovered-project", project } : null)),
+      ]);
+
+      if (firstResult?.project && !navigated) {
+        openProject(firstResult.project, firstResult.source);
+        return;
+      }
+
+      const project = await createRequest;
+      if (!navigated) {
+        openProject(project, "create-response");
+      }
     } catch (e) {
-      toast.error("Failed to create project");
+      const existingProject = await findRecentCreatedProject(projectName, projectPrompt);
+      if (existingProject && !navigated) {
+        openProject(existingProject, "recovered-after-error");
+        return;
+      }
+
+      const errorMessage = describeCreateError(e);
+      setCreateStatusMessage(errorMessage);
+      toast.error(errorMessage);
       setCreating(false);
+      return;
     }
+
+    setCreating(false);
   }
 
   async function handleDelete(e, id) {
@@ -180,7 +288,16 @@ export default function Dashboard() {
       </div>
 
       {/* Create Dialog */}
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog
+        open={open}
+        onOpenChange={(nextOpen) => {
+          setOpen(nextOpen);
+          if (!nextOpen) {
+            setCreating(false);
+          }
+          setCreateStatusMessage("");
+        }}
+      >
         <DialogContent className="sm:max-w-lg rounded-sm border-[var(--zap-border)]" data-testid="create-project-dialog">
           <DialogHeader>
             <DialogTitle className="text-xl tracking-tight font-bold" style={{ fontFamily: 'var(--font-heading)' }}>
@@ -226,6 +343,27 @@ export default function Dashboard() {
                 ))}
               </div>
             </div>
+            <div className="rounded-sm border border-[var(--zap-border)] bg-[var(--zap-bg)] px-3 py-2.5">
+              <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--zap-text-muted)]">
+                What Happens Next
+              </p>
+              <p className="mt-1 text-xs text-[var(--zap-text-body)] leading-relaxed">
+                This button only creates the project shell. Once that returns, the builder page opens and shows the live AI stages:
+                analysis, clarification, architecture, JSON and Markdown specs, frontend, backend, and review.
+              </p>
+            </div>
+            {createStatusMessage && (
+              <div
+                data-testid="create-project-status"
+                className={`rounded-sm px-3 py-2 text-xs leading-relaxed ${
+                  creating
+                    ? "border border-[var(--zap-accent)]/20 bg-[var(--zap-accent)]/5 text-[var(--zap-text-body)]"
+                    : "border border-red-200 bg-red-50 text-red-700"
+                }`}
+              >
+                {createStatusMessage}
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button
@@ -242,7 +380,7 @@ export default function Dashboard() {
               disabled={creating}
               className="bg-[var(--zap-accent)] text-white hover:opacity-90 rounded-sm"
             >
-              {creating ? "Creating..." : "Create Project"}
+              {creating ? "Opening Builder..." : "Create Project"}
             </Button>
           </DialogFooter>
         </DialogContent>

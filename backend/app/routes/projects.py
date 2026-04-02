@@ -13,6 +13,7 @@ from ..schemas import (
     ChatRequest,
     ChatResponse,
     GenerationJobRead,
+    LocalRunRead,
     MessageRead,
     PipelineStageRead,
     ProjectCreateRequest,
@@ -21,18 +22,21 @@ from ..schemas import (
     RequirementSessionRead,
 )
 from ..services import (
+    auto_start_project_from_prompt,
     create_project,
     ensure_markdown_documentation,
     get_pipeline_stage,
     get_project_or_404,
     get_project_requirement_session,
     handle_project_chat,
+    hydrate_pipeline_outputs_from_current_version,
     list_project_blueprints,
     list_project_generation_jobs,
     list_project_messages,
     list_project_prompts,
     list_project_versions,
     list_projects,
+    run_project_locally,
     serialize_project,
     soft_delete_project,
 )
@@ -58,10 +62,12 @@ def _project_payload(project, *, list_view: bool = False) -> dict[str, Any]:
 @router.post("")
 def create_project_endpoint(
     payload: ProjectCreateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(ensure_active_user),
 ) -> dict[str, Any]:
     project = create_project(db, user, payload)
+    background_tasks.add_task(auto_start_project_from_prompt, project.id, user.id, payload.prompt)
     return _project_payload(project)
 
 
@@ -81,6 +87,7 @@ def get_project_endpoint(
     user: User = Depends(ensure_active_user),
 ) -> dict[str, Any]:
     project = get_project_or_404(db, project_id, user)
+    hydrate_pipeline_outputs_from_current_version(db, project)
     return _project_payload(project)
 
 
@@ -125,6 +132,7 @@ async def get_pipeline_stage_endpoint(
     user: User = Depends(ensure_active_user),
 ) -> PipelineStageRead:
     project = get_project_or_404(db, project_id, user)
+    hydrate_pipeline_outputs_from_current_version(db, project)
     if stage == "json_transform":
         await ensure_markdown_documentation(db, project)
         db.refresh(project)
@@ -159,6 +167,16 @@ def list_generation_jobs_endpoint(
 ) -> list[GenerationJobRead]:
     project = get_project_or_404(db, project_id, user)
     return list_project_generation_jobs(db, project)
+
+
+@router.post("/{project_id}/run-local", response_model=LocalRunRead)
+def run_project_locally_endpoint(
+    project_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(ensure_active_user),
+) -> LocalRunRead:
+    project = get_project_or_404(db, project_id, user)
+    return LocalRunRead.model_validate(run_project_locally(db, project))
 
 
 @router.get("/{project_id}/blueprints", response_model=list[BlueprintVersionRead])

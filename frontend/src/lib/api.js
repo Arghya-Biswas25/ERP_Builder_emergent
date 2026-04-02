@@ -16,7 +16,7 @@ function resolveBackendUrl() {
 
   const { protocol, hostname, port, origin } = window.location;
   if (port === "3000") {
-    return "";
+    return `${protocol}//${hostname === "localhost" ? "localhost" : "127.0.0.1"}:8001`;
   }
 
   return normalizeBaseUrl(origin) || "http://127.0.0.1:8001";
@@ -26,36 +26,41 @@ const backendUrl = resolveBackendUrl();
 const API = backendUrl ? `${backendUrl}/api` : "/api";
 
 export async function createProject(name, prompt) {
-  const { data } = await axios.post(`${API}/projects`, { name, prompt });
+  const { data } = await axios.post(`${API}/projects`, { name, prompt }, { timeout: 12000 });
   return data;
 }
 
 export async function listProjects() {
-  const { data } = await axios.get(`${API}/projects`);
+  const { data } = await axios.get(`${API}/projects`, { timeout: 10000 });
   return data;
 }
 
 export async function getProject(id) {
-  const { data } = await axios.get(`${API}/projects/${id}`);
+  const { data } = await axios.get(`${API}/projects/${id}`, { timeout: 10000 });
   return data;
 }
 
 export async function deleteProject(id) {
-  const { data } = await axios.delete(`${API}/projects/${id}`);
+  const { data } = await axios.delete(`${API}/projects/${id}`, { timeout: 10000 });
   return data;
 }
 
 export async function getMessages(projectId) {
-  const { data } = await axios.get(`${API}/projects/${projectId}/messages`);
+  const { data } = await axios.get(`${API}/projects/${projectId}/messages`, { timeout: 10000 });
   return data;
 }
 
 export async function sendChat(projectId, message) {
-  const { data } = await axios.post(`${API}/projects/${projectId}/chat`, { message });
+  const { data } = await axios.post(`${API}/projects/${projectId}/chat`, { message }, { timeout: 150000 });
   return data;
 }
 
 export async function getPipelineStage(projectId, stage) {
-  const { data } = await axios.get(`${API}/projects/${projectId}/pipeline/${stage}`);
+  const { data } = await axios.get(`${API}/projects/${projectId}/pipeline/${stage}`, { timeout: 15000 });
+  return data;
+}
+
+export async function runProjectLocally(projectId) {
+  const { data } = await axios.post(`${API}/projects/${projectId}/run-local`, {}, { timeout: 300000 });
   return data;
 }

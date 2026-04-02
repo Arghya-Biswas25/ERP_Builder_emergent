@@ -138,6 +138,17 @@ class GenerationJobRead(ORMModel):
     updated_at: datetime
 
 
+class LocalRunRead(BaseModel):
+    project_id: str
+    status: str
+    message: str
+    workspace_path: str
+    frontend_url: str
+    backend_url: str
+    frontend_port: int
+    backend_port: int
+
+
 class BlueprintVersionRead(ORMModel):
     id: str
     project_id: str

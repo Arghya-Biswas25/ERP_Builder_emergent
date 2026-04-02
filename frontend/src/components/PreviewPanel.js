@@ -2,13 +2,13 @@ import { useState, useEffect, useCallback } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import CodeViewer from "@/components/CodeViewer";
-import { getPipelineStage } from "@/lib/api";
+import { getPipelineStage, runProjectLocally } from "@/lib/api";
 import { copyText, downloadFilesAsZip, downloadTextFile } from "@/lib/export";
 import { toast } from "sonner";
 import {
   LayoutDashboard, Database, Globe, Code2, ShieldCheck, FileJson, FileText, Package,
   Users, ShoppingCart, Briefcase, Settings, BarChart3, Layers, CheckCircle2,
-  AlertTriangle, XCircle, Info, Download, Copy
+  AlertTriangle, XCircle, Info, Download, Copy, Play, Loader2
 } from "lucide-react";
 
 const ICON_MAP = {
@@ -59,6 +59,16 @@ function buildFrontendDownloadFiles(projectName, frontendCode) {
   const reactVersion = frontendCode?.dependencies?.react || "^18.3.1";
   const routerVersion = frontendCode?.dependencies?.["react-router-dom"] || "^6.30.1";
   const tailwindVersion = frontendCode?.dependencies?.tailwindcss || "^3.4.17";
+  const runtimeDependencies = {
+    react: reactVersion,
+    "react-dom": reactVersion,
+    "react-router-dom": routerVersion,
+  };
+
+  Object.entries(frontendCode?.dependencies || {}).forEach(([name, version]) => {
+    if (name === "tailwindcss") return;
+    runtimeDependencies[name] = version || "*";
+  });
 
   const scaffoldFiles = [
     {
@@ -75,11 +85,7 @@ function buildFrontendDownloadFiles(projectName, frontendCode) {
             build: "vite build",
             preview: "vite preview",
           },
-          dependencies: {
-            react: reactVersion,
-            "react-dom": reactVersion,
-            "react-router-dom": routerVersion,
-          },
+          dependencies: runtimeDependencies,
           devDependencies: {
             "@vitejs/plugin-react": "^4.3.1",
             autoprefixer: "^10.4.20",
@@ -352,6 +358,28 @@ function CodeDownloadButton({ projectName, masterJson, implementationMarkdown, f
   );
 }
 
+function RunLocalButton({ canRunLocally, launching, onRunLocally, prominent = false }) {
+  return (
+    <button
+      data-testid={prominent ? "run-code-local-btn-header" : "run-code-local-btn"}
+      onClick={onRunLocally}
+      disabled={!canRunLocally || launching}
+      className={`flex items-center gap-1.5 rounded-sm border px-3 py-1.5 text-sm transition-all ${
+        prominent
+          ? canRunLocally
+            ? "border-[var(--zap-accent)] bg-[var(--zap-accent)] text-white hover:opacity-90"
+            : "border-[var(--zap-border)] bg-[var(--zap-bg)] text-[var(--zap-text-muted)] opacity-70 cursor-not-allowed"
+          : canRunLocally
+            ? "border-[var(--zap-border)] text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)]"
+            : "border-[var(--zap-border)] text-[var(--zap-text-muted)] opacity-50 cursor-not-allowed"
+      }`}
+    >
+      {launching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+      {launching ? "Launching..." : "Run on localhost"}
+    </button>
+  );
+}
+
 const TABS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "modules", label: "Modules", icon: Package },
@@ -379,6 +407,7 @@ export default function PreviewPanel({ project }) {
   const [activeTab, setActiveTab] = useState("overview");
   const [stageData, setStageData] = useState({});
   const [loadingStage, setLoadingStage] = useState(null);
+  const [launchingLocalRun, setLaunchingLocalRun] = useState(false);
   const pipeline = project?.pipeline ?? EMPTY_PIPELINE;
   const architecture = stageData.architecture?.output || pipeline.architecture?.output;
   const masterJson = stageData.json_transform?.output;
@@ -386,22 +415,42 @@ export default function PreviewPanel({ project }) {
   const frontendCode = stageData.frontend_generation?.output;
   const backendCode = stageData.backend_generation?.output;
   const review = stageData.code_review?.output;
+  const canRunLocally =
+    !!project?.id &&
+    pipeline.frontend_generation?.status === "complete" &&
+    pipeline.backend_generation?.status === "complete";
+  const activeGenerationJobId = project?.current_generation_job_id || "stable";
 
   const loadStageData = useCallback(async (stage) => {
-    if (!project?.id || stageData[stage] || pipeline[stage]?.status !== "complete") return;
+    if (!project?.id || pipeline[stage]?.status !== "complete") return;
+    const cachedStage = stageData[stage];
+    const pipelineUpdatedAt = pipeline[stage]?.updated_at || null;
+    if (
+      cachedStage?.__jobId === activeGenerationJobId &&
+      cachedStage?.__updatedAt === pipelineUpdatedAt
+    ) {
+      return;
+    }
     setLoadingStage(stage);
     try {
       const data = await getPipelineStage(project.id, stage);
-      setStageData(prev => ({ ...prev, [stage]: data }));
+      setStageData(prev => ({
+        ...prev,
+        [stage]: {
+          ...data,
+          __jobId: activeGenerationJobId,
+          __updatedAt: data?.updated_at || pipelineUpdatedAt,
+        },
+      }));
     } catch { /* ignore */ }
     setLoadingStage(null);
-  }, [project?.id, stageData, pipeline]);
+  }, [activeGenerationJobId, project?.id, stageData, pipeline]);
 
   useEffect(() => {
     if (activeTab === "code") {
-      if (pipeline.json_transform?.status === "complete" && !stageData.json_transform) loadStageData("json_transform");
-      if (pipeline.frontend_generation?.status === "complete" && !stageData.frontend_generation) loadStageData("frontend_generation");
-      if (pipeline.backend_generation?.status === "complete" && !stageData.backend_generation) loadStageData("backend_generation");
+      if (pipeline.json_transform?.status === "complete") loadStageData("json_transform");
+      if (pipeline.frontend_generation?.status === "complete") loadStageData("frontend_generation");
+      if (pipeline.backend_generation?.status === "complete") loadStageData("backend_generation");
     } else {
       const stage = TAB_STAGE_MAP[activeTab];
       if (stage) loadStageData(stage);
@@ -410,19 +459,80 @@ export default function PreviewPanel({ project }) {
     activeTab,
     loadStageData,
     pipeline.backend_generation?.status,
+    pipeline.backend_generation?.updated_at,
     pipeline.frontend_generation?.status,
+    pipeline.frontend_generation?.updated_at,
     pipeline.json_transform?.status,
-    stageData.backend_generation,
-    stageData.frontend_generation,
-    stageData.json_transform,
+    pipeline.json_transform?.updated_at,
+    stageData,
+  ]);
+
+  useEffect(() => {
+    if (pipeline.json_transform?.status === "complete") loadStageData("json_transform");
+    if (pipeline.frontend_generation?.status === "complete") loadStageData("frontend_generation");
+    if (pipeline.backend_generation?.status === "complete") loadStageData("backend_generation");
+  }, [
+    loadStageData,
+    pipeline.backend_generation?.status,
+    pipeline.backend_generation?.updated_at,
+    pipeline.frontend_generation?.status,
+    pipeline.frontend_generation?.updated_at,
+    pipeline.json_transform?.status,
+    pipeline.json_transform?.updated_at,
+    stageData,
   ]);
 
   // Auto-load architecture when it completes
   useEffect(() => {
-    if (pipeline.architecture?.status === "complete" && !stageData.architecture) {
+    if (pipeline.architecture?.status === "complete") {
       loadStageData("architecture");
     }
-  }, [pipeline.architecture?.status, stageData.architecture, loadStageData]);
+  }, [pipeline.architecture?.status, pipeline.architecture?.updated_at, stageData, loadStageData]);
+
+  async function handleRunLocally() {
+    if (!canRunLocally || launchingLocalRun || !project?.id) {
+      return;
+    }
+
+    const launchWindow = window.open("", "_blank");
+    if (launchWindow) {
+      launchWindow.document.title = "Launching Generated ERP";
+      launchWindow.document.body.innerHTML = `
+        <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 24px; color: #0f172a;">
+          <h2 style="margin: 0 0 12px;">Launching Generated ERP</h2>
+          <p style="margin: 0; line-height: 1.6;">Starting the exact generated frontend and backend artifacts on localhost. The browser code viewer can keep loading in parallel while the runtime starts.</p>
+        </div>
+      `;
+    }
+
+    setLaunchingLocalRun(true);
+    try {
+      const runtime = await runProjectLocally(project.id);
+      if (launchWindow) {
+        launchWindow.location.href = runtime.frontend_url;
+      } else {
+        window.open(runtime.frontend_url, "_blank", "noopener,noreferrer");
+      }
+      toast.success(`Generated app running at ${runtime.frontend_url}`);
+    } catch (error) {
+      const detail = error?.response?.data?.detail;
+      const message =
+        (Array.isArray(detail) ? detail.map((item) => item?.msg || item?.message).filter(Boolean).join("; ") : detail) ||
+        error?.message ||
+        "Couldn't run the generated app locally.";
+      if (launchWindow && !launchWindow.closed) {
+        launchWindow.document.body.innerHTML = `
+          <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 24px; color: #7f1d1d;">
+            <h2 style="margin: 0 0 12px;">Run Failed</h2>
+            <p style="margin: 0; line-height: 1.6;">${String(message)}</p>
+          </div>
+        `;
+      }
+      toast.error(message);
+    } finally {
+      setLaunchingLocalRun(false);
+    }
+  }
 
   return (
     <div className="h-full flex flex-col" data-testid="preview-panel">
@@ -444,7 +554,13 @@ export default function PreviewPanel({ project }) {
         </div>
 
         {activeTab === "code" && (
-          <div className="shrink-0 py-2">
+          <div className="shrink-0 py-2 flex items-center gap-2">
+            <RunLocalButton
+              canRunLocally={canRunLocally}
+              launching={launchingLocalRun}
+              onRunLocally={handleRunLocally}
+              prominent
+            />
             <CodeDownloadButton
               projectName={project?.name}
               masterJson={masterJson}
@@ -473,10 +589,13 @@ export default function PreviewPanel({ project }) {
               backendCode={backendCode}
               pipeline={pipeline}
               loadingStage={loadingStage}
+              canRunLocally={canRunLocally}
+              launchingLocalRun={launchingLocalRun}
+              onRunLocally={handleRunLocally}
             />
           )}
           {activeTab === "review" && <ReviewTab review={review} />}
-          {activeTab === "json" && <JsonTab masterJson={masterJson} />}
+          {activeTab === "json" && <JsonTab projectName={project?.name} masterJson={masterJson} />}
           {activeTab === "markdown" && <MarkdownTab projectName={project?.name} implementationMarkdown={implementationMarkdown} />}
         </div>
       </ScrollArea>
@@ -760,7 +879,18 @@ function ApiTab({ architecture }) {
 }
 
 /* --- CODE --- */
-function CodeTab({ projectName, masterJson, implementationMarkdown, frontendCode, backendCode, pipeline, loadingStage }) {
+function CodeTab({
+  projectName,
+  masterJson,
+  implementationMarkdown,
+  frontendCode,
+  backendCode,
+  pipeline,
+  loadingStage,
+  canRunLocally,
+  launchingLocalRun,
+  onRunLocally,
+}) {
   const [codeType, setCodeType] = useState("frontend");
   const code = codeType === "frontend" ? frontendCode : backendCode;
   const frontendFiles = frontendCode?.files || [];
@@ -811,6 +941,11 @@ function CodeTab({ projectName, masterJson, implementationMarkdown, frontendCode
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          <RunLocalButton
+            canRunLocally={canRunLocally}
+            launching={launchingLocalRun}
+            onRunLocally={onRunLocally}
+          />
           <CodeDownloadButton
             projectName={projectName}
             masterJson={masterJson}
@@ -820,6 +955,11 @@ function CodeTab({ projectName, masterJson, implementationMarkdown, frontendCode
           />
         </div>
       </div>
+      {canRunLocally && isCodeLoading && !viewerFiles.length && (
+        <div className="mb-4 rounded-sm border border-[var(--zap-border)] bg-white px-4 py-3 text-sm text-[var(--zap-text-body)]">
+          The run button is ready now. It launches the stored generated frontend and backend artifacts even while the code viewer is still loading.
+        </div>
+      )}
       {!viewerFiles.length ? (
         <EmptyState
           icon={Code2}
@@ -924,8 +1064,20 @@ function ReviewTab({ review }) {
 }
 
 /* --- JSON --- */
-function JsonTab({ masterJson }) {
+function JsonTab({ projectName, masterJson }) {
   const [copied, setCopied] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
+
+  function fileName() {
+    const baseName = String(projectName || "ai-erp-builder")
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .toLowerCase();
+    return `${baseName || "ai-erp-builder"}-blueprint.json`;
+  }
 
   async function handleCopyJson() {
     const success = await copyText(JSON.stringify(masterJson, null, 2));
@@ -939,6 +1091,20 @@ function JsonTab({ masterJson }) {
     toast.success("JSON copied to clipboard.");
   }
 
+  function handleDownloadJson() {
+    try {
+      downloadTextFile(JSON.stringify(masterJson, null, 2), {
+        fileName: fileName(),
+        mimeType: "application/json;charset=utf-8",
+      });
+      setDownloaded(true);
+      window.setTimeout(() => setDownloaded(false), 2000);
+      toast.success("JSON blueprint downloaded.");
+    } catch {
+      toast.error("Couldn't download the JSON right now.");
+    }
+  }
+
   if (!masterJson) {
     return <EmptyState icon={FileJson} title="No Master JSON Yet" description="The JSON schema will be generated after architecture design." />;
   }
@@ -946,14 +1112,24 @@ function JsonTab({ masterJson }) {
     <div className="animate-fade-in-up" data-testid="json-content">
       <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
         <h2 className="text-xl font-bold tracking-tight" style={{ fontFamily: 'var(--font-heading)' }}>Master JSON Schema</h2>
-        <button
-          data-testid="copy-json-btn"
-          onClick={handleCopyJson}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
-        >
-          {copied ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Copy className="w-3.5 h-3.5" />}
-          {copied ? "Copied JSON" : "Copy JSON"}
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            data-testid="download-json-btn"
+            onClick={handleDownloadJson}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
+          >
+            {downloaded ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Download className="w-3.5 h-3.5" />}
+            {downloaded ? "Downloaded JSON" : "Download JSON"}
+          </button>
+          <button
+            data-testid="copy-json-btn"
+            onClick={handleCopyJson}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-[var(--zap-border)] rounded-sm text-[var(--zap-text-heading)] hover:border-[var(--zap-accent)] hover:text-[var(--zap-accent)] transition-all"
+          >
+            {copied ? <CheckCircle2 className="w-3.5 h-3.5 text-[var(--zap-success)]" /> : <Copy className="w-3.5 h-3.5" />}
+            {copied ? "Copied JSON" : "Copy JSON"}
+          </button>
+        </div>
       </div>
       <div className="code-block max-h-[calc(100vh-200px)] overflow-auto">
         <pre className="text-xs leading-relaxed">{JSON.stringify(masterJson, null, 2)}</pre>

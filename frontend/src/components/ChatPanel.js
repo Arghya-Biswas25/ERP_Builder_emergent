@@ -3,6 +3,79 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Send, Bot, User } from "lucide-react";
 
+const STAGE_DETAILS = {
+  INIT: {
+    title: "Project shell created",
+    summary: "The backend should start processing your prompt right away. If it stays here, the page will retry automatically.",
+    model: "No LLM call yet",
+    api: "POST /api/projects",
+    action: "Wait a moment while the builder page syncs with the backend.",
+  },
+  ANALYZING: {
+    title: "Requirement analysis",
+    summary: "The app is reading your prompt and inferring the business type, scale, modules, and missing details.",
+    model: "deepseek/deepseek-r1-distill-llama-70b",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "The UI is polling /api/projects/{id} and /api/projects/{id}/messages.",
+  },
+  GATHERING: {
+    title: "Clarifying requirements",
+    summary: "The planner is asking focused follow-up questions before it locks the final ERP requirements.",
+    model: "deepseek/deepseek-r1-distill-llama-70b",
+    api: "OpenRouter /api/v1/chat/completions via POST /api/projects/{id}/chat",
+    action: "Reply in the chat box to move the project to architecture and generation.",
+  },
+  ARCHITECTING: {
+    title: "Planning the ERP architecture",
+    summary: "The app is updating the current ERP architecture in place, keeping unaffected parts intact.",
+    model: "deepseek/deepseek-r1-distill-llama-70b",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "The builder is working in the background.",
+  },
+  TRANSFORMING: {
+    title: "Generating blueprint specs",
+    summary: "The current JSON and Markdown blueprint are being revised in place instead of restarting from scratch.",
+    model: "deepseek/deepseek-r1-distill-llama-70b",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "The next step is parallel frontend and backend generation.",
+  },
+  GENERATING_FRONTEND: {
+    title: "Generating code",
+    summary: "Frontend and backend code are being updated over the current ERP version, not rebuilt from zero.",
+    model: "deepseek/deepseek-chat-v3-0324",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "The backend also enters generation during this stage.",
+  },
+  GENERATING_BACKEND: {
+    title: "Generating code",
+    summary: "Frontend and backend code are being updated over the current ERP version, not rebuilt from zero.",
+    model: "deepseek/deepseek-chat-v3-0324",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "The builder is packaging generated files and saving artifacts.",
+  },
+  REVIEWING: {
+    title: "Reviewing generated code",
+    summary: "The final model pass is checking the generated code for quality and structure before completion.",
+    model: "deepseek/deepseek-chat-v3-0324",
+    api: "OpenRouter /api/v1/chat/completions",
+    action: "When this finishes, the project moves to COMPLETE.",
+  },
+  COMPLETE: {
+    title: "ERP ready",
+    summary: "The blueprint, generated code bundles, and review output are available in the preview tabs.",
+    model: "No active LLM call",
+    api: "Read-only UI polling",
+    action: "You can inspect outputs or ask for revisions. New requests apply on top of the current generated version.",
+  },
+  ERROR: {
+    title: "Generation failed",
+    summary: "A backend stage failed before the project could finish.",
+    model: "See backend job error",
+    api: "Check the latest stage and retry",
+    action: "Use the chat to refine the request or retry generation.",
+  },
+};
+
 function renderMarkdown(text) {
   if (!text) return "";
   return text
@@ -11,10 +84,19 @@ function renderMarkdown(text) {
     .replace(/\n/g, '<br/>');
 }
 
+function summarizeMessage(text) {
+  const normalized = (text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  if (normalized.length <= 180) return normalized;
+  return `${normalized.slice(0, 177)}...`;
+}
+
 export default function ChatPanel({ messages, onSend, isLoading, projectStatus }) {
   const [input, setInput] = useState("");
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+  const stageInfo = STAGE_DETAILS[projectStatus] || STAGE_DETAILS.INIT;
+  const latestAssistantMessage = [...messages].reverse().find((msg) => msg.role === "assistant")?.content;
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -45,6 +127,31 @@ export default function ChatPanel({ messages, onSend, isLoading, projectStatus }
            ["ARCHITECTING","TRANSFORMING","GENERATING_FRONTEND","GENERATING_BACKEND","REVIEWING"].includes(projectStatus) ?
            "Building your ERP..." : "Describe your ERP system"}
         </p>
+      </div>
+
+      <div className="px-4 py-3 border-b border-[var(--zap-border)] bg-[var(--zap-bg)]/60" data-testid="live-process-card">
+        <div className="rounded-sm border border-[var(--zap-border)] bg-white p-3 space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[var(--zap-text-muted)]">
+              Live Process
+            </p>
+            <span className="text-[10px] uppercase tracking-[0.14em] text-[var(--zap-text-muted)]">
+              {projectStatus || "INIT"}
+            </span>
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-[var(--zap-text-heading)]">{stageInfo.title}</p>
+            <p className="mt-1 text-xs leading-relaxed text-[var(--zap-text-body)]">{stageInfo.summary}</p>
+          </div>
+          <div className="space-y-1.5 text-xs text-[var(--zap-text-body)]">
+            <p><span className="font-medium text-[var(--zap-text-heading)]">Model:</span> {stageInfo.model}</p>
+            <p><span className="font-medium text-[var(--zap-text-heading)]">API:</span> {stageInfo.api}</p>
+            <p><span className="font-medium text-[var(--zap-text-heading)]">Next:</span> {stageInfo.action}</p>
+            {latestAssistantMessage && (
+              <p><span className="font-medium text-[var(--zap-text-heading)]">Latest update:</span> {summarizeMessage(latestAssistantMessage)}</p>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Messages */}
